@@ -1,13 +1,6 @@
 // kmeans_mpi.cpp
-// K-means in k dimensions using MPI (distributed-memory).
-//
-// Usage:
-//   mpirun -np <P> ./kmeans_mpi <csv_file> <K> <max_iters> [tolerance]
-//
-// Only rank 0 loads the CSV, then scatters the data to all ranks.
-// CSV format: numeric only, comma-separated, no header:
-//   - each row = one data point
-//   - each column = one feature
+// K-means clustering using MPI so each process handles part of the dataset.
+// Rank 0 reads data and sends to others, then we collaborate to update centroids.
 
 #include <mpi.h>
 #include <iostream>
@@ -19,9 +12,7 @@
 #include <cmath>
 #include <limits>
 
-// ---------------------------------------------------------------------------
-// CSV loader (used only on rank 0): numeric, comma-separated, no header
-// ---------------------------------------------------------------------------
+// loading numeric CSV (only rank 0 uses this)
 bool load_csv_numeric(const std::string &filename,
                       std::vector<float> &data,
                       int &num_points,
@@ -37,6 +28,7 @@ bool load_csv_numeric(const std::string &filename,
     num_dims = -1;
 
     std::string line;
+    // reading file row by row
     while (std::getline(file, line)) {
         if (line.empty())
             continue;
@@ -46,6 +38,7 @@ bool load_csv_numeric(const std::string &filename,
         int col_count = 0;
         std::vector<float> row_values;
 
+        // split by comma and convert to float
         while (std::getline(ss, cell, ',')) {
             if (cell.empty())
                 continue;
@@ -53,9 +46,8 @@ bool load_csv_numeric(const std::string &filename,
                 float val = std::stof(cell);
                 row_values.push_back(val);
                 col_count++;
-            } catch (const std::exception &) {
-                std::cerr << "Warning: non-numeric value in CSV, skipping line: "
-                          << line << "\n";
+            } catch (...) {
+                // if non-numeric values → skip this row entirely
                 col_count = 0;
                 row_values.clear();
                 break;
@@ -65,9 +57,12 @@ bool load_csv_numeric(const std::string &filename,
         if (col_count == 0)
             continue;
 
+        // set dimension from the first row
         if (num_dims == -1) {
             num_dims = col_count;
-        } else if (col_count != num_dims) {
+        }
+        // check all rows have same number of columns
+        else if (col_count != num_dims) {
             std::cerr << "Error: inconsistent number of columns in CSV.\n";
             return false;
         }
@@ -86,21 +81,18 @@ bool load_csv_numeric(const std::string &filename,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// K-means helpers
-// ---------------------------------------------------------------------------
-
-// Random initialization on rank 0: pick K distinct random points as initial centroids
+// choose K random points as starting centroids (rank 0 does it)
 void init_centroids_random(const std::vector<float> &data,
                            int N, int d, int K,
                            std::vector<float> &centroids) {
     centroids.resize(K * d);
-    std::mt19937 rng(12345); // fixed seed for reproducibility
+    std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, N - 1);
 
     std::vector<int> chosen;
     chosen.reserve(K);
 
+    // make sure we select distinct rows
     for (int k = 0; k < K; ++k) {
         int idx;
         bool unique;
@@ -121,7 +113,7 @@ void init_centroids_random(const std::vector<float> &data,
     }
 }
 
-// Compute squared Euclidean distance between two d-dimensional points
+// helper for squared Euclidean distance
 inline float squared_distance(const float *a, const float *b, int d) {
     float dist = 0.0f;
     for (int j = 0; j < d; ++j) {
@@ -131,16 +123,14 @@ inline float squared_distance(const float *a, const float *b, int d) {
     return dist;
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv); // initialize MPI
 
     int rank = 0, size = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); // find my rank ID
+    MPI_Comm_size(MPI_COMM_WORLD, &size); // number of processes
 
+    // only rank 0 checks arguments
     if (rank == 0 && argc < 4) {
         std::cerr << "Usage: " << argv[0]
                   << " <csv_file> <K> <max_iters> [tolerance]\n";
@@ -149,7 +139,7 @@ int main(int argc, char **argv) {
 
     std::string filename;
     int K = 0, max_iters = 0;
-    float tol = 1e-4f;
+    float tol = 1e-4f; // default stopping tolerance
 
     if (rank == 0) {
         filename = argv[1];
@@ -160,29 +150,28 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Broadcast parameters K, max_iters, tol
+    // broadcast parameters so all ranks know
     MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&max_iters, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&tol, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    // Rank 0 loads CSV
     std::vector<float> full_data;
     int N = 0, d = 0;
+
+    // only rank 0 loads the dataset
     if (rank == 0) {
         if (!load_csv_numeric(filename, full_data, N, d)) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         if (K <= 0 || K > N) {
-            std::cerr << "Error: invalid K (number of clusters).\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        std::cout << "Running MPI K-means with "
-                  << size << " processes, K=" << K
-                  << ", max_iters=" << max_iters
-                  << ", tolerance=" << tol << "\n";
+        std::cout << "Running MPI K-means with " << size
+                  << " processes, K=" << K
+                  << ", max_iters=" << max_iters << "\n";
     }
 
-    // Broadcast N and d to all ranks
+    // broadcast dataset shape to all ranks
     MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&d, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -191,7 +180,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    // Decide how many points each rank gets
+    // split dataset rows across processes as evenly as possible
     std::vector<int> counts_points(size);
     std::vector<int> displs_points(size);
 
@@ -199,23 +188,21 @@ int main(int argc, char **argv) {
         int base = N / size;
         int rem = N % size;
         int offset = 0;
-
         for (int r = 0; r < size; ++r) {
-            int n_local = base + (r < rem ? 1 : 0);
-            counts_points[r] = n_local;
+            counts_points[r] = base + (r < rem ? 1 : 0);
             displs_points[r] = offset;
-            offset += n_local;
+            offset += counts_points[r];
         }
     }
 
-    // Broadcast counts_points and displs_points so each rank knows its size
+    // share distribution info with all ranks
     MPI_Bcast(counts_points.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(displs_points.data(), size, MPI_INT, 0, MPI_COMM_WORLD);
 
     int local_N = counts_points[rank];
-    std::vector<float> local_data(local_N * d);
+    std::vector<float> local_data(local_N * d); // buffer for my portion of data
 
-    // Prepare sendcounts and displs for MPI_Scatterv (in floats)
+    // convert counts from "points" to "floats" for scattering
     std::vector<int> sendcounts_f(size), displs_f(size);
     if (rank == 0) {
         for (int r = 0; r < size; ++r) {
@@ -224,7 +211,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Scatter data rows to each rank
+    // scatter subsets of rows to each rank
     MPI_Scatterv(rank == 0 ? full_data.data() : nullptr,
                  rank == 0 ? sendcounts_f.data() : nullptr,
                  rank == 0 ? displs_f.data() : nullptr,
@@ -235,29 +222,30 @@ int main(int argc, char **argv) {
                  0,
                  MPI_COMM_WORLD);
 
-    // Initialize centroids on rank 0, then broadcast to all
+    // initialize and broadcast centroids
     std::vector<float> centroids(K * d);
     if (rank == 0) {
         init_centroids_random(full_data, N, d, K, centroids);
     }
     MPI_Bcast(centroids.data(), K * d, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    // Local structures
+    // local accumulators
     std::vector<int> local_assignments(local_N, 0);
     std::vector<float> local_sums(K * d);
     std::vector<int>   local_counts(K);
 
-    // Global sums and counts (same on all ranks after Allreduce)
+    // global accumulators
     std::vector<float> global_sums(K * d);
     std::vector<int>   global_counts(K);
 
-    double t_start = MPI_Wtime();
+    double t_start = MPI_Wtime(); // start timing K-means
 
     for (int iter = 0; iter < max_iters; ++iter) {
-        // 1) Assignment + local accumulation
+        // reset local accumulators each iteration
         std::fill(local_sums.begin(), local_sums.end(), 0.0f);
         std::fill(local_counts.begin(), local_counts.end(), 0);
 
+        // assign each local point to nearest centroid
         for (int i = 0; i < local_N; ++i) {
             const float *x = &local_data[i * d];
 
@@ -265,8 +253,7 @@ int main(int argc, char **argv) {
             float best_dist = std::numeric_limits<float>::max();
 
             for (int k = 0; k < K; ++k) {
-                const float *c = &centroids[k * d];
-                float dist = squared_distance(x, c, d);
+                float dist = squared_distance(x, &centroids[k * d], d);
                 if (dist < best_dist) {
                     best_dist = dist;
                     best_k = k;
@@ -274,57 +261,47 @@ int main(int argc, char **argv) {
             }
 
             local_assignments[i] = best_k;
-
-            // accumulate local sums
-            local_counts[best_k] += 1;
-            float *cluster_sum = &local_sums[best_k * d];
-            for (int j = 0; j < d; ++j) {
-                cluster_sum[j] += x[j];
-            }
+            local_counts[best_k]++;
+            float *sum = &local_sums[best_k * d];
+            for (int j = 0; j < d; ++j)
+                sum[j] += x[j];
         }
 
-        // 2) Allreduce to get global sums and counts
+        // combine all local results into global sums/counts
         MPI_Allreduce(local_sums.data(), global_sums.data(),
                       K * d, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
         MPI_Allreduce(local_counts.data(), global_counts.data(),
                       K, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
-        // 3) Update centroids and compute max shift (all ranks do same work)
+        // update centroids from global results
         float max_shift_sq = 0.0f;
-
         for (int k = 0; k < K; ++k) {
             int count = global_counts[k];
-            if (count == 0) {
-                // no points in this cluster, keep old centroid
-                continue;
-            }
+            if (count == 0) continue; // leave centroid if no points assigned
 
-            float *c   = &centroids[k * d];
+            float *c = &centroids[k * d];
             float *sum = &global_sums[k * d];
 
             for (int j = 0; j < d; ++j) {
-                float old_val = c[j];
-                float new_val = sum[j] / static_cast<float>(count);
-                float diff = new_val - old_val;
+                float new_val = sum[j] / count;
+                float diff = new_val - c[j];
                 float shift_sq = diff * diff;
-                if (shift_sq > max_shift_sq) {
+                if (shift_sq > max_shift_sq)
                     max_shift_sq = shift_sq;
-                }
                 c[j] = new_val;
             }
         }
 
         float max_shift = std::sqrt(max_shift_sq);
 
-        if (rank == 0) {
+        // only rank 0 prints progress
+        if (rank == 0)
             std::cout << "Iteration " << iter
                       << ", centroid max shift = " << max_shift << "\n";
-        }
 
         if (max_shift < tol) {
-            if (rank == 0) {
+            if (rank == 0)
                 std::cout << "Converged at iteration " << iter << "\n";
-            }
             break;
         }
     }
@@ -332,11 +309,13 @@ int main(int argc, char **argv) {
     double t_end = MPI_Wtime();
     double local_time = t_end - t_start;
     double max_time = 0.0;
+
+    // find the slowest rank time for fairness
     MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        std::cout << "Total K-means time (MPI, max over ranks): "
-                  << max_time << " s\n\n";
+        std::cout << "Total K-means time (max rank time): "
+                  << max_time << " s\n";
 
         std::cout << "Final centroids:\n";
         for (int k = 0; k < K; ++k) {

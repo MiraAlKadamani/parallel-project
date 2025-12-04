@@ -1,11 +1,5 @@
 // kmeans_omp.cpp
-// OpenMP K-means in k dimensions with CSV loading.
-// Usage:
-//   ./kmeans_omp <csv_file> <K> <max_iters> [tolerance]
-//
-// CSV format: numeric only, comma-separated, no header.
-//   - each row = one data point
-//   - each column = one feature
+// Parallel K-means using OpenMP. Each thread processes part of the dataset to speed up clustering.
 
 #include <iostream>
 #include <fstream>
@@ -18,9 +12,7 @@
 #include <chrono>
 #include <omp.h>
 
-// ---------------------------------------------------------------------------
-// CSV loader: numeric, comma-separated, no header
-// ---------------------------------------------------------------------------
+// load numeric CSV: used to read dataset into a flat vector
 bool load_csv_numeric(const std::string &filename,
                       std::vector<float> &data,
                       int &num_points,
@@ -36,6 +28,7 @@ bool load_csv_numeric(const std::string &filename,
     num_dims = -1;
 
     std::string line;
+    // read file row by row
     while (std::getline(file, line)) {
         if (line.empty())
             continue;
@@ -45,16 +38,15 @@ bool load_csv_numeric(const std::string &filename,
         int col_count = 0;
         std::vector<float> row_values;
 
+        // split the line by commas and convert to float
         while (std::getline(ss, cell, ',')) {
             if (cell.empty())
                 continue;
             try {
-                float val = std::stof(cell);
-                row_values.push_back(val);
+                row_values.push_back(std::stof(cell));
                 col_count++;
-            } catch (const std::exception &) {
-                std::cerr << "Warning: non-numeric value in CSV, skipping line: "
-                          << line << "\n";
+            } catch (...) {
+                // if anything is not numeric, we drop the row
                 col_count = 0;
                 row_values.clear();
                 break;
@@ -64,13 +56,17 @@ bool load_csv_numeric(const std::string &filename,
         if (col_count == 0)
             continue;
 
+        // detect dimension from first valid row
         if (num_dims == -1) {
             num_dims = col_count;
-        } else if (col_count != num_dims) {
+        }
+        // verify consistent dimensionality
+        else if (col_count != num_dims) {
             std::cerr << "Error: inconsistent number of columns in CSV.\n";
             return false;
         }
 
+        // append row into flat data vector
         data.insert(data.end(), row_values.begin(), row_values.end());
         num_points++;
     }
@@ -85,16 +81,12 @@ bool load_csv_numeric(const std::string &filename,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// K-means helpers
-// ---------------------------------------------------------------------------
-
-// Random initialization: pick K distinct random points as initial centroids
+// choose K random rows as starting centroids
 void init_centroids_random(const std::vector<float> &data,
                            int N, int d, int K,
                            std::vector<float> &centroids) {
     centroids.resize(K * d);
-    std::mt19937 rng(12345); // fixed seed for reproducibility
+    std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, N - 1);
 
     std::vector<int> chosen;
@@ -104,23 +96,20 @@ void init_centroids_random(const std::vector<float> &data,
         int idx;
         bool unique;
         do {
-            unique = true;
             idx = dist(rng);
-            for (int c : chosen) {
-                if (c == idx) { unique = false; break; }
-            }
+            unique = (std::find(chosen.begin(), chosen.end(), idx) == chosen.end());
         } while (!unique);
         chosen.push_back(idx);
 
+        // copy selected row into centroid storage
         const float *src = &data[idx * d];
-        float *dst = &centroids[k * d];
         for (int j = 0; j < d; ++j) {
-            dst[j] = src[j];
+            centroids[k * d + j] = src[j];
         }
     }
 }
 
-// Compute squared Euclidean distance between two d-dimensional points
+// squared Euclidean distance used for comparing cluster closeness
 inline float squared_distance(const float *a, const float *b, int d) {
     float dist = 0.0f;
     for (int j = 0; j < d; ++j) {
@@ -130,15 +119,14 @@ inline float squared_distance(const float *a, const float *b, int d) {
     return dist;
 }
 
-// ---------------------------------------------------------------------------
-// OpenMP K-means
-// ---------------------------------------------------------------------------
+// main OpenMP K-means function
 void kmeans_openmp(const std::vector<float> &data,
                    int N, int d, int K,
                    int max_iters, float tol,
                    std::vector<float> &centroids_out,
                    std::vector<int> &assignments_out) {
-    // Initialize centroids
+
+    // initialize centroids first time outside loop
     std::vector<float> centroids;
     init_centroids_random(data, N, d, K, centroids);
 
@@ -146,37 +134,36 @@ void kmeans_openmp(const std::vector<float> &data,
     std::vector<float> sums(K * d);
     std::vector<int> counts(K);
 
+    // main K-means loop
     for (int iter = 0; iter < max_iters; ++iter) {
-        // 1. Assignment step (parallel over points)
+
+        // assignment step: parallel over data points
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < N; ++i) {
             const float *x = &data[i * d];
-
             int best_k = 0;
             float best_dist = std::numeric_limits<float>::max();
 
+            // compute distance to each centroid
             for (int k = 0; k < K; ++k) {
-                const float *c = &centroids[k * d];
-                float dist = squared_distance(x, c, d);
+                float dist = squared_distance(x, &centroids[k * d], d);
                 if (dist < best_dist) {
                     best_dist = dist;
                     best_k = k;
                 }
             }
-
-            assignments[i] = best_k;
+            assignments[i] = best_k; // record chosen cluster
         }
 
-        // 2. Update step:
-        // Reset global sums and counts
+        // reset cluster sums/counts before update
         std::fill(sums.begin(), sums.end(), 0.0f);
         std::fill(counts.begin(), counts.end(), 0);
 
-        // Parallel accumulation using per-thread local sums and counts
+        // parallel accumulation: each thread keeps its own partial sums
         #pragma omp parallel
         {
             std::vector<float> local_sums(K * d, 0.0f);
-            std::vector<int>   local_counts(K, 0);
+            std::vector<int> local_counts(K, 0);
 
             #pragma omp for nowait
             for (int i = 0; i < N; ++i) {
@@ -184,47 +171,36 @@ void kmeans_openmp(const std::vector<float> &data,
                 const float *x = &data[i * d];
 
                 local_counts[k] += 1;
-                float *cluster_sum = &local_sums[k * d];
-                for (int j = 0; j < d; ++j) {
-                    cluster_sum[j] += x[j];
-                }
+                for (int j = 0; j < d; ++j)
+                    local_sums[k * d + j] += x[j];
             }
 
-            // Reduce local_sums/local_counts into global sums/counts
+            // reduce local results into global
             #pragma omp critical
             {
                 for (int k = 0; k < K; ++k) {
                     counts[k] += local_counts[k];
-                    float *sum_global = &sums[k * d];
-                    float *sum_local  = &local_sums[k * d];
-                    for (int j = 0; j < d; ++j) {
-                        sum_global[j] += sum_local[j];
-                    }
+                    for (int j = 0; j < d; ++j)
+                        sums[k * d + j] += local_sums[k * d + j];
                 }
             }
-        } // end parallel region
+        }
 
-        // Compute new centroids, track max shift
+        // update centroids and track how much they moved
         float max_shift_sq = 0.0f;
 
         for (int k = 0; k < K; ++k) {
             int count = counts[k];
-            if (count == 0) {
-                // No points in this cluster: keep old centroid
-                continue;
-            }
+            if (count == 0)
+                continue; // leave unchanged if no points went to this cluster
 
             float *c = &centroids[k * d];
-            float *sum = &sums[k * d];
-
             for (int j = 0; j < d; ++j) {
-                float old_val = c[j];
-                float new_val = sum[j] / static_cast<float>(count);
-                float diff = new_val - old_val;
+                float new_val = sums[k * d + j] / count;
+                float diff = new_val - c[j];
                 float shift_sq = diff * diff;
-                if (shift_sq > max_shift_sq) {
+                if (shift_sq > max_shift_sq)
                     max_shift_sq = shift_sq;
-                }
                 c[j] = new_val;
             }
         }
@@ -233,19 +209,18 @@ void kmeans_openmp(const std::vector<float> &data,
         std::cout << "Iteration " << iter
                   << ", centroid max shift = " << max_shift << "\n";
 
+        // stopping condition if centroids not moving much
         if (max_shift < tol) {
             std::cout << "Converged at iteration " << iter << "\n";
             break;
         }
     }
 
-    centroids_out = std::move(centroids);
-    assignments_out = std::move(assignments);
+    // return final centroids and cluster assignments
+    centroids_out = centroids;
+    assignments_out = assignments;
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0]
@@ -253,12 +228,13 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    // input args from user
     std::string filename = argv[1];
     int K = std::stoi(argv[2]);
     int max_iters = std::stoi(argv[3]);
     float tol = (argc >= 5) ? std::stof(argv[4]) : 1e-4f;
 
-    // Load CSV
+    // load dataset into memory
     std::vector<float> data;
     int N = 0, d = 0;
     if (!load_csv_numeric(filename, data, N, d)) {
@@ -266,35 +242,32 @@ int main(int argc, char **argv) {
     }
 
     if (K <= 0 || K > N) {
-        std::cerr << "Error: invalid K (number of clusters).\n";
+        std::cerr << "Error: invalid K.\n";
         return EXIT_FAILURE;
     }
 
     std::cout << "Running OpenMP K-means with K=" << K
-              << ", max_iters=" << max_iters
-              << ", tolerance=" << tol << "\n";
-    std::cout << "OpenMP reports " << omp_get_max_threads()
-              << " max threads (use OMP_NUM_THREADS to change).\n";
+              << ", max_iters=" << max_iters << "\n";
+    std::cout << "OpenMP max threads: " << omp_get_max_threads() << "\n";
 
+    // to store final result
     std::vector<float> centroids;
     std::vector<int> assignments;
 
+    // time measurement for performance
     auto t_start = std::chrono::high_resolution_clock::now();
-
     kmeans_openmp(data, N, d, K, max_iters, tol, centroids, assignments);
-
     auto t_end = std::chrono::high_resolution_clock::now();
-    double seconds = std::chrono::duration<double>(t_end - t_start).count();
 
+    double seconds = std::chrono::duration<double>(t_end - t_start).count();
     std::cout << "Total K-means time (OpenMP): " << seconds << " s\n\n";
 
-    // Print final centroids
+    // show final cluster centers
     std::cout << "Final centroids:\n";
     for (int k = 0; k < K; ++k) {
         std::cout << "Centroid " << k << ": ";
         for (int j = 0; j < d; ++j) {
-            std::cout << centroids[k * d + j];
-            if (j + 1 < d) std::cout << ", ";
+            std::cout << centroids[k * d + j] << (j + 1 < d ? ", " : "");
         }
         std::cout << "\n";
     }
